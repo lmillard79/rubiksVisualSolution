@@ -41,8 +41,16 @@ class Cube:
     permanent per-sticker identity assigned once at construction and carried
     along by every move exactly like color is - moves relocate stickers,
     they never change which sticker is where. That second array is what lets
-    PieceRegistry (built later) answer "where is this specific piece now"
-    without any extra bookkeeping in `apply`.
+    PieceRegistry answer "where is this specific piece now".
+
+    `position_of` is a redundant reverse index (sticker id -> (face, r, c))
+    kept incrementally in step with `sticker_ids`, purely for performance:
+    the solver's search hot path (PieceRegistry.sticker_locations, called on
+    every BFS node to check goal/dedup state) originally re-scanned every
+    cell on every call, which was the dominant cost once a search needed to
+    track more than a couple of pieces. `apply` already computes exactly
+    which stickers moved where for `_relocations_for`, so updating this index
+    alongside it is O(stickers actually moved) instead of an O(n^2) re-scan.
     """
 
     def __init__(self, n: int):
@@ -51,12 +59,14 @@ class Cube:
             face: np.full((n, n), SOLVED_COLOR_OF_FACE[face], dtype=np.uint8) for face in ALL_FACES
         }
         self.sticker_ids: dict[Face, np.ndarray] = {}
+        self.position_of: dict[int, tuple[Face, int, int]] = {}
         next_id = 0
         for face in ALL_FACES:
             arr = np.empty((n, n), dtype=np.int32)
             for r in range(n):
                 for c in range(n):
                     arr[r, c] = next_id
+                    self.position_of[next_id] = (face, r, c)
                     next_id += 1
             self.sticker_ids[face] = arr
 
@@ -65,6 +75,7 @@ class Cube:
         other.n = self.n
         other.colors = {f: arr.copy() for f, arr in self.colors.items()}
         other.sticker_ids = {f: arr.copy() for f, arr in self.sticker_ids.items()}
+        other.position_of = dict(self.position_of)
         return other
 
     def is_solved(self) -> bool:
@@ -89,11 +100,15 @@ class Cube:
 
         new_colors = {f: arr.copy() for f, arr in self.colors.items()}
         new_ids = {f: arr.copy() for f, arr in self.sticker_ids.items()}
+        new_position_of = dict(self.position_of)
         for src_face, src_r, src_c, dst_face, dst_r, dst_c in relocations:
+            sticker_id = int(self.sticker_ids[src_face][src_r, src_c])
             new_colors[dst_face][dst_r, dst_c] = self.colors[src_face][src_r, src_c]
-            new_ids[dst_face][dst_r, dst_c] = self.sticker_ids[src_face][src_r, src_c]
+            new_ids[dst_face][dst_r, dst_c] = sticker_id
+            new_position_of[sticker_id] = (dst_face, dst_r, dst_c)
         self.colors = new_colors
         self.sticker_ids = new_ids
+        self.position_of = new_position_of
 
     def apply_algorithm(self, moves: list[Move]) -> None:
         for move in moves:

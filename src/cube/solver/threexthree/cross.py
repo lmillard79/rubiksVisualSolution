@@ -17,4 +17,8 @@ ALL_BASIC_MOVES = [parse_move(f"{f.value}{s}") for f in ALL_FACES for s in ("", 
 
 def cross_steps(registry: PieceRegistry, solved_ref: Cube, max_depth: int = 8) -> list[PieceStep]:
     d_edges = [pid for pid in registry.pieces_of_kind("edge") if Face.D in registry.piece_faces(solved_ref, pid)]
-    return [PieceStep(pid, ALL_BASIC_MOVES, max_depth) for pid in d_edges]
+    total = len(d_edges)
+    return [
+        PieceStep(pid, ALL_BASIC_MOVES, max_depth, stage="Cross", label=f"placing cross edge {i + 1} of {total}")
+        for i, pid in enumerate(d_edges)
+    ]

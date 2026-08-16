@@ -26,6 +26,7 @@ from typing import Callable, Hashable
 from ..moves import Move
 from ..pieces import PieceId, PieceRegistry
 from ..state import Cube
+from .types import SolveStep
 
 GoalTest = Callable[[Cube], bool]
 EncodeState = Callable[[Cube], Hashable]
@@ -63,6 +64,105 @@ def restricted_search(
                 continue
             visited.add(key)
             queue.append((candidate, path + [move]))
+
+    return None
+
+
+def _reconstruct_bidirectional(forward_state: dict, backward_state: dict, meet_key: Hashable) -> list[Move]:
+    forward_moves: list[Move] = []
+    key = meet_key
+    while forward_state[key][0] is not None:
+        parent_key, move, _ = forward_state[key]
+        forward_moves.append(move)
+        key = parent_key
+    forward_moves.reverse()
+
+    backward_moves: list[Move] = []
+    key = meet_key
+    while backward_state[key][0] is not None:
+        parent_key, move, _ = backward_state[key]
+        backward_moves.append(move)
+        key = parent_key
+
+    return forward_moves + backward_moves
+
+
+def bidirectional_search(
+    cube: Cube,
+    solved_ref: Cube,
+    encode_state: EncodeState,
+    allowed_moves: list[Move],
+    max_depth: int,
+) -> list[Move] | None:
+    """Like `restricted_search`, but for the specific (and, for this project,
+    universal) case where the goal is "encode_state(cube) equals
+    encode_state(solved_ref)": explores forward from `cube` AND backward from
+    `solved_ref` simultaneously (using each move's inverse on the backward
+    side), stopping as soon as both sides reach a common encode_state.
+
+    This is sound, not an approximation, for a fact specific to how cube
+    moves work: a move is a permutation of *positions* that doesn't depend on
+    what's currently in them. So if a forward path and a backward path both
+    reach some state with the same tracked-piece encoding, concatenating
+    them is guaranteed to carry the *actual* tracked stickers from `cube` all
+    the way to their positions in `solved_ref`, regardless of what either
+    path's untracked stickers happened to be doing along the way.
+
+    The payoff is depth, not branching: meeting in the middle for a
+    depth-d solution costs roughly 2*b^(d/2) instead of b^d, which is the
+    difference between tractable and not once several pieces are locked in
+    and dedup on the full combined state barely collapses anything (see the
+    module docstring) - i.e. exactly the case that made plain
+    `restricted_search` hang on later F2L pieces.
+    """
+    start_key = encode_state(cube)
+    goal_key = encode_state(solved_ref)
+    if start_key == goal_key:
+        return []
+
+    forward_state: dict[Hashable, tuple] = {start_key: (None, None, cube.clone())}
+    backward_state: dict[Hashable, tuple] = {goal_key: (None, None, solved_ref.clone())}
+    forward_frontier = [start_key]
+    backward_frontier = [goal_key]
+    inverse_moves = [(m, m.inverse()) for m in allowed_moves]
+
+    depth_used = 0
+    while depth_used < max_depth and forward_frontier and backward_frontier:
+        expand_forward = len(forward_frontier) <= len(backward_frontier)
+        if expand_forward:
+            new_frontier = []
+            for key in forward_frontier:
+                _, _, base = forward_state[key]
+                for move in allowed_moves:
+                    candidate = base.clone()
+                    candidate.apply(move)
+                    ckey = encode_state(candidate)
+                    if ckey in forward_state:
+                        continue
+                    forward_state[ckey] = (key, move, candidate)
+                    if ckey in backward_state:
+                        return _reconstruct_bidirectional(forward_state, backward_state, ckey)
+                    new_frontier.append(ckey)
+            forward_frontier = new_frontier
+        else:
+            new_frontier = []
+            for key in backward_frontier:
+                _, _, base = backward_state[key]
+                for move, inverse in inverse_moves:
+                    candidate = base.clone()
+                    candidate.apply(inverse)
+                    ckey = encode_state(candidate)
+                    if ckey in backward_state:
+                        continue
+                    # `move` (not `inverse`) is what carries ckey's cube
+                    # forward to key's cube - that's the direction
+                    # reconstruction needs.
+                    backward_state[ckey] = (key, move, candidate)
+                    if ckey in forward_state:
+                        return _reconstruct_bidirectional(forward_state, backward_state, ckey)
+                    new_frontier.append(ckey)
+            backward_frontier = new_frontier
+        depth_used += 1
 
     return None
 
@@ -120,17 +220,36 @@ class PieceStep:
     `allowed_moves` set (rather than always reaching for every move on the
     cube) is what keeps later steps fast - see the module docstring's note
     on why untargeted move sets blow up once several pieces are locked in.
+
+    `stage`/`label` travel with the step (rather than being passed
+    separately to `solve_pieces_incrementally`) specifically so that steps
+    from *different* stages - e.g. cross's edges and F2L's corners/edges -
+    can be concatenated into one call. That matters for correctness, not
+    just labeling: every piece placed in a single call is protected as a
+    "must stay solved" constraint for every step after it, so splitting
+    cross and F2L into two separate calls would silently stop protecting
+    cross while F2L runs.
     """
 
-    __slots__ = ("piece_id", "allowed_moves", "max_depth")
+    __slots__ = ("piece_id", "allowed_moves", "max_depth", "stage", "label")
 
-    def __init__(self, piece_id: PieceId, allowed_moves: list[Move], max_depth: int):
+    def __init__(self, piece_id: PieceId, allowed_moves: list[Move], max_depth: int, stage: str = "", label: str = ""):
         self.piece_id = piece_id
         self.allowed_moves = allowed_moves
         self.max_depth = max_depth
+        self.stage = stage
+        self.label = label
 
 
-def _combined_state_fn(registry: PieceRegistry, piece_ids: list[PieceId]):
+def combined_piece_state_fn(registry: PieceRegistry, piece_ids: list[PieceId]):
+    """A hashable encode/goal function reading exactly where each of
+    `piece_ids` currently sits (position + orientation). Public because
+    reduction stages that need to combine piece-exact tracking with other
+    conditions (e.g. edge-pairing also protecting the centers stage's
+    color-exact result) drive `bidirectional_search` directly with a
+    composite of this and their own state function, rather than going
+    through `solve_pieces_incrementally`.
+    """
     sticker_order = [sid for pid in piece_ids for sid in registry.stickers_of_piece[pid]]
 
     def state_of(cube: Cube) -> tuple:
@@ -151,57 +270,57 @@ def solve_pieces_incrementally(
     registry: PieceRegistry,
     solved_ref: Cube,
     steps: list[PieceStep],
-    fallback_moves: list[Move] | None = None,
-    fallback_max_depth: int | None = None,
-) -> list[Move] | None:
+    fallback_tiers: list[tuple[list[Move], int]] | None = None,
+) -> list[SolveStep] | None:
     """Place each step's piece at its solved_ref position, in order, without
     disturbing previously-placed pieces - the shared shape behind centers,
-    edge-pairing, cross, and F2L.
+    edge-pairing, cross, and F2L. Returns one labeled `SolveStep` per piece
+    placed (using that PieceStep's own `stage`/`label`), so a visualizer can
+    show which piece and why, or None if any step fails.
 
-    The goal test always requires *every* locked-in piece to be correct, so
-    the result is exact. Deduplication, however, is deliberately keyed on
-    just the piece actively being searched for, not the whole locked set:
-    keying on everything locked in (the "obviously correct" version) makes
-    the BFS frontier grow with the branching factor at every step, because
-    almost no two distinct move sequences land on the exact same combination
-    of N piece-states - it stopped being usable past a handful of locked
-    pieces. Keying on only the new piece caps the frontier at that piece's
-    own state space (a couple dozen values for an edge or corner) regardless
-    of how many pieces came before, which is what actually keeps this fast.
-    The tradeoff is real but narrow: BFS can occasionally discard the one
-    path that both reaches a given new-piece state *and* keeps everything
-    else intact, in favor of a same-new-piece-state path found first that
-    doesn't - so this fast pass isn't provably complete. `fallback_moves`
-    (tried first with the same fast dedup, then - only as a last resort -
-    with the exact all-locked dedup) is what makes it correct in practice:
-    the slow exact search is only ever paid for the rare step the fast pass
-    can't handle, not for every step.
+    Steps from more than one logical stage (e.g. cross's edges followed by
+    F2L's corners/edges) can and should be concatenated into a single
+    `steps` list/call when later stages must not disturb earlier ones -
+    every piece placed becomes a "stay solved" constraint for every step
+    after it *within this call*, so splitting them into separate calls
+    silently drops that protection across the split (this was a real bug
+    here, not a hypothetical one - solve3.py originally called this once
+    for cross and once for F2L, so F2L was free to disturb the cross).
+
+    Both the meeting condition and the dedup key require *every* locked-in
+    piece to be correct, so this is exact: no solution is ever missed
+    because of an overly-coarse dedup key (see `bidirectional_search` for
+    why that's sound here specifically, not just an optimization). That used
+    to be too slow once more than a handful of pieces were locked in, for
+    two compounding reasons, both now fixed: `Cube.apply`/
+    `PieceRegistry.sticker_locations` were re-deriving sticker positions
+    from scratch on every BFS node (fixed by the incremental
+    `Cube.position_of` index and the cached move-relocation table in
+    state.py), and plain one-directional BFS pays for the *full* solution
+    depth in branching^depth (fixed by searching from both ends at once -
+    see `bidirectional_search`). A step's own tight `allowed_moves` (e.g.
+    U + 2 slot faces for F2L) still matters - smaller branching is always
+    cheaper - and `fallback_tiers` is a small escalating ladder tried only
+    if that tight set isn't enough (the piece is buried somewhere those
+    moves can't reach), widening before it deepens.
     """
-    target_state_of = {step.piece_id: registry.piece_state(solved_ref, step.piece_id) for step in steps}
-
-    solution: list[Move] = []
+    solve_steps: list[SolveStep] = []
     working = cube.clone()
     locked: list[PieceId] = []
 
     for step in steps:
         locked = locked + [step.piece_id]
-        goal_state = _combined_state_fn(registry, locked)
-        target = tuple(target_state_of[pid] for pid in locked)
+        goal_state = combined_piece_state_fn(registry, locked)
 
-        def goal_test(c: Cube, goal_state=goal_state, target=target) -> bool:
-            return goal_state(c) == target
-
-        fast_encode = _combined_state_fn(registry, [step.piece_id])
-
-        move_step = restricted_search(working, goal_test, fast_encode, step.allowed_moves, step.max_depth)
-        if move_step is None and fallback_moves is not None:
-            move_step = restricted_search(working, goal_test, fast_encode, fallback_moves, fallback_max_depth)
-        if move_step is None and fallback_moves is not None:
-            # last resort: exact (slow) dedup on the full locked set
-            move_step = restricted_search(working, goal_test, goal_state, fallback_moves, fallback_max_depth)
+        move_step = bidirectional_search(working, solved_ref, goal_state, step.allowed_moves, step.max_depth)
+        if move_step is None and fallback_tiers:
+            for tier_moves, tier_depth in fallback_tiers:
+                move_step = bidirectional_search(working, solved_ref, goal_state, tier_moves, tier_depth)
+                if move_step is not None:
+                    break
         if move_step is None:
             return None
         working.apply_algorithm(move_step)
-        solution.extend(move_step)
+        solve_steps.append(SolveStep(stage=step.stage, description=step.label, moves=move_step, pieces=[step.piece_id]))
 
-    return solution
+    return solve_steps

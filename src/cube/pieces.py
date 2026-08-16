@@ -59,33 +59,17 @@ class PieceRegistry:
         return [pid for pid, k in self.kind_of_piece.items() if k == kind]
 
     def piece_positions(self, cube: Cube, piece_id: PieceId) -> list[StickerRef]:
-        """Where this piece's stickers currently are on `cube` (which may be scrambled).
-        A cheap full scan (<=96 cells even at n=4) rather than an incrementally
-        maintained position map - simplest correct thing, and fast enough that
-        the plan explicitly calls out not to bother optimizing it.
+        """Where this piece's stickers currently are on `cube` (which may be
+        scrambled). O(1) per sticker via `cube.position_of`, the reverse
+        index Cube maintains incrementally - this is on the solver search's
+        hot path (called on every BFS node), so it matters that this isn't a
+        per-call O(n^2) re-scan.
         """
-        target_ids = set(self.stickers_of_piece[piece_id])
-        found = []
-        for face in ALL_FACES:
-            ids = cube.sticker_ids[face]
-            for r in range(self.n):
-                for c in range(self.n):
-                    if int(ids[r, c]) in target_ids:
-                        found.append(StickerRef(face, r, c))
-        return found
+        return [StickerRef(*cube.position_of[sid]) for sid in self.stickers_of_piece[piece_id]]
 
     def sticker_locations(self, cube: Cube, sticker_ids) -> dict[int, StickerRef]:
-        """Current location of each requested sticker id, in one scan."""
-        wanted = set(sticker_ids)
-        found: dict[int, StickerRef] = {}
-        for face in ALL_FACES:
-            ids = cube.sticker_ids[face]
-            for r in range(self.n):
-                for c in range(self.n):
-                    sid = int(ids[r, c])
-                    if sid in wanted:
-                        found[sid] = StickerRef(face, r, c)
-        return found
+        """Current location of each requested sticker id."""
+        return {sid: StickerRef(*cube.position_of[sid]) for sid in sticker_ids}
 
     def piece_faces(self, cube: Cube, piece_id: PieceId) -> set[Face]:
         """Which faces this piece's stickers currently sit on (ignores exact
